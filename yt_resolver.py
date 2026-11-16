@@ -43,20 +43,12 @@ NRESULTS = int(os.environ.get("NRESULTS", "12"))   # tiles per search; lower it 
 RESULTS = {}   # n -> {"vid", "title"}
 THUMBS = {}    # n -> jpeg bytes
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-# spoken name (lowercase, no leading "the") -> channel /videos page; plays the NEWEST upload
-CHANNELS = {
-    # "my favourite channel": "https://www.youtube.com/@SomeChannel/videos",
-}
 
 
 def lookup(q, n=1):
-    """Return up to n [{vid,title}] for a search, URL, or CHANNELS shortcut; None on timeout."""
-    key = re.sub(r"^the ", "", q.lower()).strip()
+    """Return up to n [{vid,title}] for a search or a YouTube URL; None on timeout."""
     extra = []
-    if key in CHANNELS:
-        target = CHANNELS[key]
-        extra = ["--playlist-items", f"1-{n}"]
-    elif YT_URL.match(q):
+    if YT_URL.match(q):
         target = q
     else:
         target = f"ytsearch{n}:{q}"

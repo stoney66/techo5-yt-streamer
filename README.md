@@ -1,82 +1,189 @@
 # techo5-yt-streamer
 
-Play YouTube on an Echo Show running [TECHO5](https://github.com/HuskerMinion/techo5) firmware, by voice or from a Home Assistant script.
-
-The TECHO5 `play_video` action wants a plain video URL it can fetch with ffmpeg. Direct YouTube (googlevideo) URLs get rejected, so this small container does the fetching instead: it runs `yt-dlp`, remuxes with `ffmpeg` to MPEG-TS, and serves the stream over HTTP on your LAN.
+Search YouTube by voice on an Echo Show running [TECHO5](https://github.com/HuskerMinion/techo5) firmware, then tap a thumbnail to play it. Built for kids: say "play youtube super kitties", pick a tile.
 
 ```
-"play youtube <query>" -> HA -> GET /resolve?q=... -> {"title", "url"} -> esphome.<device>_play_video
-                                       |
-                              yt-dlp | ffmpeg (-c copy, mpegts) -> GET /stream?s=<session>
+voice -> HA -> /search?q=...  -> top 12 results + thumbnails (/thumb/1.jpg ... /thumb/12.jpg)
+Show shows a "picker" dashboard of the thumbnails -> tap one -> /pick?n=N
+  -> yt-dlp | ffmpeg (-c copy -> MPEG-TS) -> /stream -> esphome.<device>_play_video
 ```
 
-## Features
-- Search by words (`ytsearch1`) or pass a YouTube URL
-- Optional channel shortcuts: say a channel name, get its newest upload
-- Pre-buffers before returning the URL, so the device doesn't time out waiting for the first byte
-- Tolerates the device opening the stream twice (reconnects allowed, idle sessions are reaped)
-- Title returned with channel / date / duration for the device's info screen
-- `/loading?t=<text>` serves a short "Loading ..." video so the Show has something to display while the real stream starts
-- Works on whichever Echo Show you spoke to (no per-device config)
+The TECHO5 `play_video` action needs a plain video URL, and direct YouTube URLs get rejected, so this container does the fetching: it runs `yt-dlp`, remuxes with `ffmpeg`, and serves the stream on your LAN.
 
 ## Requirements
-- Docker + Docker Compose on a host reachable from the Echo Show
-- Home Assistant with one or more TECHO5 devices (each exposing `esphome.<device>_play_video` / `_stop_video`) and a voice assistant satellite on each
+- Docker + Docker Compose on a host the Echo Show can reach
+- Home Assistant with a TECHO5 Echo Show (`esphome.<device>_play_video`, `_stop_video`, `_dashboard_path`, `_dashboard_show`, `_dashboard_hide`) and a voice assistant on it
+- The device's Home Assistant access set up (**Connect to Home Assistant** on its setup page), since the picker is a *drawn* dashboard
+- The device's **Video** switch on
 
-## Run
+## 1. Run the container
 ```
 docker compose up -d --build
-curl "http://<host>:8099/resolve?q=nasa+launch"
+curl "http://<host>:8099/search?q=nasa+launch"      # -> {"count": 12, "results": [...]}
 ```
-You should get JSON with a `title` and a `url`. The container updates `yt-dlp` on every start; YouTube breaks it regularly, so restart (`docker compose restart`) if searches begin failing.
+Port `8099` is LAN only: there is no authentication. The container updates `yt-dlp` on every start; restart it if searches start failing.
 
-## Home Assistant
+## 2. Home Assistant
 
-`configuration.yaml`:
+The device is never hard-coded: scripts use whichever Show is handling the voice request (its assist satellite is `processing`), falling back to `my_show` when run from elsewhere. Its name, slugified, must match its ESPHome actions (`MyShow` -> `esphome.myshow_play_video`). Change `my_show` below to your device's slug.
+
+### configuration.yaml
 ```yaml
 rest_command:
-  yt_resolve:
-    url: "http://<RESOLVER_HOST>:8099/resolve?q={{ q | urlencode }}"
-    method: get
+  yt_search:
+    url: "http://<RESOLVER_HOST>:8099/search?q={{ q | urlencode }}"
     timeout: 60
+  yt_pick:
+    url: "http://<RESOLVER_HOST>:8099/pick?n={{ n }}"
+    timeout: 60
+
+input_text:
+  yt_node:            # remembers which Show asked
+    name: YT node
+    max: 64
+
+intent_script: !include_dir_merge_named intent_scripts   # if you don't already have this
 ```
 
-`scripts.yaml` — no device is hard-coded: the script targets whichever Echo Show is currently handling the voice request (its assist satellite is in the `processing` state), and falls back to `my_show` when run from elsewhere (e.g. a dashboard tile). The device's name, slugified, must match its ESPHome actions, e.g. device `MyShow` -> `esphome.myshow_play_video`.
+### scripts.yaml
+The Show has one **Dashboard** setting (Off / Drawn on the device / Streamed / Tessera). The picker needs *Drawn on the device*, so `youtube_search` switches to it and `youtube_pick` switches back. **Set the option in `youtube_pick` to your normal mode.** Check the exact entity id and option names under the device's Configuration card (`select.<node>_dashboard`).
+
 ```yaml
-show_play_youtube:
-  alias: Show play YouTube
+youtube_search:
+  alias: YouTube search -> tiles
+  mode: restart
   fields:
     q: {}
   sequence:
     - variables:
-        sat: >-
-          {{ states.assist_satellite | selectattr('state', 'eq', 'processing')
-             | map(attribute='entity_id') | first | default('') }}
-        dev_name: "{{ device_attr(sat, 'name') if sat else none }}"
-        node: "{{ (dev_name | slugify) if dev_name else 'my_show' }}"   # fallback device name
-    - delay: "00:00:02"
-    # Instant "Loading ..." card while yt-dlp works
+        node: >-
+          {% set sat = states.assist_satellite | selectattr('state','eq','processing') | list %}
+          {% if sat %}{{ device_attr(sat[0].entity_id, 'name') | slugify }}{% else %}my_show{% endif %}
+    - action: input_text.set_value
+      target: { entity_id: input_text.yt_node }
+      data: { value: "{{ node }}" }
+    - action: rest_command.yt_search
+      data: { q: "{{ q }}" }
+    - action: select.select_option
+      target: { entity_id: "select.{{ node }}_dashboard" }
+      data: { option: "Drawn on the device" }
+    - action: "esphome.{{ node }}_dashboard_path"
+      data: { path: yt-picker/tiles }      # <dashboard url>/<view path>
+    - delay: "00:00:03"                    # lets the voice turn finish first
+    - action: "esphome.{{ node }}_dashboard_show"
+    # picker timeout: if nobody picked within 3 minutes, go back
+    - delay: "00:03:00"
+    - if: "{{ is_state('select.' ~ node ~ '_dashboard', 'Drawn on the device') }}"
+      then:
+        - action: "esphome.{{ node }}_dashboard_hide"
+        - action: select.select_option
+          target: { entity_id: "select.{{ node }}_dashboard" }
+          data: { option: "Tessera" }
+
+youtube_pick:
+  alias: YouTube pick tile
+  fields:
+    n: {}
+  sequence:
+    - variables:
+        node: "{{ states('input_text.yt_node') }}"
+    - action: "esphome.{{ node }}_dashboard_hide"
+    - action: select.select_option
+      target: { entity_id: "select.{{ node }}_dashboard" }
+      data: { option: "Tessera" }          # your normal mode
     - action: "esphome.{{ node }}_play_video"
       continue_on_error: true
       data:
-        title: "Loading {{ q }}"
-        url: "http://<RESOLVER_HOST>:8099/loading?t={{ q | urlencode }}"
-    - action: rest_command.yt_resolve
-      data:
-        q: "{{ q }}"
+        title: "Loading"
+        url: "http://<RESOLVER_HOST>:8099/loading?t=video"
+    - action: rest_command.yt_pick
+      data: { n: "{{ n }}" }
       response_variable: r
     - if: "{{ not (r.status == 200 and r.content.url is defined) }}"
       then:
         - action: "esphome.{{ node }}_stop_video"
           continue_on_error: true
-        - stop: "YouTube lookup failed"
+        - stop: "YouTube pick failed"
     - action: "esphome.{{ node }}_play_video"
       data:
         title: "{{ r.content.title }}"
         url: "{{ r.content.url }}"
+
+# The drawn dashboard doesn't pass a card's `data:` on tap, so each tile gets its own script.
+youtube_pick_1: { alias: YT pick 1, sequence: [ { action: script.youtube_pick, data: { n: 1 } } ] }
+youtube_pick_2: { alias: YT pick 2, sequence: [ { action: script.youtube_pick, data: { n: 2 } } ] }
+youtube_pick_3: { alias: YT pick 3, sequence: [ { action: script.youtube_pick, data: { n: 3 } } ] }
+youtube_pick_4: { alias: YT pick 4, sequence: [ { action: script.youtube_pick, data: { n: 4 } } ] }
+youtube_pick_5: { alias: YT pick 5, sequence: [ { action: script.youtube_pick, data: { n: 5 } } ] }
+youtube_pick_6: { alias: YT pick 6, sequence: [ { action: script.youtube_pick, data: { n: 6 } } ] }
+youtube_pick_7: { alias: YT pick 7, sequence: [ { action: script.youtube_pick, data: { n: 7 } } ] }
+youtube_pick_8: { alias: YT pick 8, sequence: [ { action: script.youtube_pick, data: { n: 8 } } ] }
+youtube_pick_9: { alias: YT pick 9, sequence: [ { action: script.youtube_pick, data: { n: 9 } } ] }
+youtube_pick_10: { alias: YT pick 10, sequence: [ { action: script.youtube_pick, data: { n: 10 } } ] }
+youtube_pick_11: { alias: YT pick 11, sequence: [ { action: script.youtube_pick, data: { n: 11 } } ] }
+youtube_pick_12: { alias: YT pick 12, sequence: [ { action: script.youtube_pick, data: { n: 12 } } ] }
 ```
 
-Voice: `custom_sentences/en/youtube.yaml`
+`youtube_search` waits 3 seconds before showing the dashboard so the voice turn finishes first, and puts the Show back to its normal mode after 3 minutes if nobody picks (`mode: restart` makes a new search cancel the old timer).
+
+### Dashboard
+Settings > Dashboards > Add dashboard > New from scratch, URL `yt-picker`. Open it, three-dot menu > Raw configuration editor, and paste this. Use your host's LAN IP for `<RESOLVER_HOST>`:
+
+```yaml
+views:
+  - title: Tiles
+    path: tiles
+    cards:
+      - type: grid
+        columns: 2
+        square: false
+        cards:
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/1.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_1 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/2.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_2 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/3.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_3 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/4.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_4 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/5.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_5 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/6.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_6 }
+      - type: grid
+        columns: 2
+        square: false
+        cards:
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/7.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_7 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/8.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_8 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/9.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_9 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/10.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_10 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/11.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_11 }
+          - type: picture
+            image: http://<RESOLVER_HOST>:8099/thumb/12.jpg
+            tap_action: { action: perform-action, perform_action: script.youtube_pick_12 }
+```
+
+The Show lays cards out in two columns, so two grids side by side with 2 tiles across each gives 4 across and 3 down. On a smaller screen (Show 5) lower the tile count: set `NRESULTS` (see below), and remove cards and the matching scripts.
+
+### Voice
+`custom_sentences/en/youtube.yaml`:
 ```yaml
 language: "en"
 intents:
@@ -91,26 +198,7 @@ lists:
     wildcard: true
 ```
 
-`intent_scripts/youtube.yaml` (needs `intent_script: !include_dir_merge_named intent_scripts` in `configuration.yaml`):
-```yaml
-YoutubePlay:
-  action:
-    - action: script.turn_on
-      target: { entity_id: script.show_play_youtube }
-      data:
-        variables:
-          q: "{{ query }}"
-  speech:
-    text: "Playing"
-```
-Then run `conversation.reload` (or restart HA).
-
-## Tile picker (optional)
-
-Search by voice, then tap a thumbnail to play. `/search?q=...` keeps the top `NRESULTS` (default 12) results and renders `/thumb/1.jpg`..`/thumb/12.jpg` (title drawn on); `/pick?n=N` starts result N. Needs the Dashboard to be set to **Drawn on the device** while the picker is up.
-
-Setup: see `ha-picker.example.yaml` (REST commands, helper, scripts, dashboard view). Then point the voice intent at `script.youtube_search`:
-
+`intent_scripts/youtube.yaml`:
 ```yaml
 YoutubePlay:
   action:
@@ -120,31 +208,27 @@ YoutubePlay:
         variables:
           q: "{{ query }}"
   speech:
-    text: "Here are the results for {{ query }}"
+    text: "Loading {{ query }}"
 ```
 
-Notes:
-- The picker switches the device's **Dashboard** setting to *Drawn on the device* and `youtube_pick` switches it back (to *Tessera* in the example - change it to your usual mode). If the picker is closed without a pick, switch it back by hand.
-- The drawn dashboard doesn't forward a card's `data:`, hence one tiny `youtube_pick_N` script (1-12) per tile.
-- Needs the device's Home Assistant token (**Connect to Home Assistant** on the setup page).
-- The 3 second delay in `youtube_search` keeps the voice turn from closing the dashboard.
+Reload (`conversation.reload`, and reload intent scripts / scripts), then say **"play youtube super kitties"**.
 
-## Configuration
-Edit the constants at the top of `yt_resolver.py`:
+## Settings (`yt_resolver.py`)
 
 | Name | Default | Meaning |
 |---|---|---|
-| `PORT` | `8099` | Listen port |
-| `FORMAT` | `18/best[vcodec^=avc1][acodec^=mp4a][height<=720]` | yt-dlp format; must be H.264 + AAC, muxed, ≤720p for the TECHO5 player |
-| `START_DELAY` | `2` | Seconds to hold the stream after `/resolve` (keeps the device info screen visible) |
-| `PREBUFFER_CHUNKS` | `4` | 64 KB chunks buffered before `/resolve` returns |
-| `NRESULTS` (env) | `12` | Tiles per search. Lower it for small screens (Echo Show 5) |
-| `CHANNELS` | `{}` | `"spoken name": "https://www.youtube.com/@Channel/videos"` — plays the newest upload |
+| `PORT` (env) | `8099` | Listen port |
+| `BIND` (env) | `0.0.0.0` | Listen address inside the container |
+| `NRESULTS` (env) | `12` | Tiles per search; lower it for small screens |
+| `FORMAT` | `18/best[vcodec^=avc1][acodec^=mp4a][height<=720]` | yt-dlp format; must be muxed H.264 + AAC, <=720p for the TECHO5 player |
+| `START_DELAY` | `2` | Seconds to hold the stream after `/pick` returns |
+| `PREBUFFER_CHUNKS` | `4` | 64 KB chunks buffered before `/pick` returns; raise it if playback stutters at the start |
 
-## Security
-**LAN only.** There is no authentication. Anyone who can reach port 8099 can make this host download and stream arbitrary YouTube content. Do not port-forward it, and consider binding the published port to your LAN IP in `docker-compose.yaml` (`"192.168.x.x:8099:8099"`).
+Other endpoints: `/resolve?q=...` returns `{"title","url"}` for the top hit directly, for your own scripts; `/loading?t=text` serves a short "Loading ..." video (used by `youtube_pick`).
 
-## Troubleshooting
-- **Device times out / "error opening"** – check `docker logs yt-resolver`; a slow `/resolve` usually means yt-dlp is out of date (`docker compose restart`).
-- **Works once, then 404 on `/stream`** – sessions expire 15 s after the last client leaves, or 120 s if nobody connects.
-- **403 from YouTube** – restart to pull the latest yt-dlp; the `mweb` player client is used by default.
+## Notes and limits
+- **LAN only.** Anyone who can reach port 8099 can make the host download and stream YouTube video. Don't port-forward it; consider publishing the port on your LAN IP only in `docker-compose.yaml`.
+- **One search at a time.** The 12 results and thumbnails are shared, and `input_text.yt_node` holds only the last Show that searched. Fine for one household; two Shows searching at once will overwrite each other's tiles.
+- If the picker is closed without choosing, the Show stays in *Drawn on the device* until the 3 minute timeout puts it back.
+- Thumbnails are 4:3 with the title underneath, because the Show crops 16:9 pictures to squarer tiles.
+- YouTube extraction breaks periodically; `docker compose restart` pulls the latest yt-dlp.
