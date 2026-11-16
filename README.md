@@ -101,7 +101,7 @@ YoutubePlay:
         variables:
           q: "{{ query }}"
   speech:
-    text: "Okay"
+    text: "Here are the results for {{ query }}"
 ```
 Then run `conversation.reload` (or restart HA).
 
