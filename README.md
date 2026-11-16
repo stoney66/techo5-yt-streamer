@@ -72,8 +72,8 @@ youtube_search:
       data: { path: yt-picker/tiles }      # <dashboard url>/<view path>
     - delay: "00:00:03"                    # lets the voice turn finish first
     - action: "esphome.{{ node }}_dashboard_show"
-    # picker timeout: if nobody picked within 3 minutes, go back
-    - delay: "00:03:00"
+    # picker timeout: if nobody picked within 30 seconds, go back
+    - delay: "00:00:30"
     - if: "{{ is_state('select.' ~ node ~ '_dashboard', 'Drawn on the device') }}"
       then:
         - action: "esphome.{{ node }}_dashboard_hide"
