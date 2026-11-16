@@ -15,6 +15,7 @@ The TECHO5 `play_video` action needs a plain video URL, and direct YouTube URLs 
 - Home Assistant with a TECHO5 Echo Show (`esphome.<device>_play_video`, `_stop_video`, `_dashboard_path`, `_dashboard_show`, `_dashboard_hide`) and a voice assistant on it
 - The device's Home Assistant access set up (**Connect to Home Assistant** on its setup page), since the picker is a *drawn* dashboard
 - The device's **Video** switch on
+- Note I have only tested on Echo Show 8 Gen 2!
 
 ## 1. Run the container
 ```
