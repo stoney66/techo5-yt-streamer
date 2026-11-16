@@ -1,0 +1,12 @@
+services:
+  yt-resolver:
+    build: .
+    container_name: yt-resolver
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    volumes:
+      - yt-cache:/root/.cache/yt-dlp
+
+volumes:
+  yt-cache:
