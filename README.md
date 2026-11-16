@@ -15,7 +15,6 @@ The TECHO5 `play_video` action needs a plain video URL, and direct YouTube URLs 
 - Home Assistant with a TECHO5 Echo Show (`esphome.<device>_play_video`, `_stop_video`, `_dashboard_path`, `_dashboard_show`, `_dashboard_hide`) and a voice assistant on it
 - The device's Home Assistant access set up (**Connect to Home Assistant** on its setup page), since the picker is a *drawn* dashboard
 - The device's **Video** switch on
-- Note I have only tested on Echo Show 8 Gen 2!
 
 ## 1. Run the container
 ```
@@ -60,25 +59,32 @@ youtube_search:
         node: >-
           {% set sat = states.assist_satellite | selectattr('state','eq','processing') | list %}
           {% if sat %}{{ device_attr(sat[0].entity_id, 'name') | slugify }}{% else %}my_show{% endif %}
+    - variables:
+        dash: >-
+          {% set ns = namespace(e='') %}
+          {% for s in states.select if s.entity_id.endswith('_dashboard') and node in s.entity_id and 'Drawn on the device' in s.attributes.options %}
+            {% set ns.e = s.entity_id %}
+          {% endfor %}
+          {{ ns.e }}
     - action: input_text.set_value
       target: { entity_id: input_text.yt_node }
       data: { value: "{{ node }}" }
     - action: rest_command.yt_search
       data: { q: "{{ q }}" }
     - action: select.select_option
-      target: { entity_id: "select.{{ node }}_dashboard" }
+      target: { entity_id: "{{ dash }}" }
       data: { option: "Drawn on the device" }
     - action: "esphome.{{ node }}_dashboard_path"
       data: { path: yt-picker/tiles }      # <dashboard url>/<view path>
     - delay: "00:00:03"                    # lets the voice turn finish first
     - action: "esphome.{{ node }}_dashboard_show"
-    # picker timeout: if nobody picked within 3 minutes, go back
-    - delay: "00:03:00"
-    - if: "{{ is_state('select.' ~ node ~ '_dashboard', 'Drawn on the device') }}"
+    # picker timeout: if nobody picked within 30 seconds, go back
+    - delay: "00:00:30"
+    - if: "{{ is_state(dash, 'Drawn on the device') }}"
       then:
         - action: "esphome.{{ node }}_dashboard_hide"
         - action: select.select_option
-          target: { entity_id: "select.{{ node }}_dashboard" }
+          target: { entity_id: "{{ dash }}" }
           data: { option: "Tessera" }
 
 youtube_pick:
@@ -88,9 +94,15 @@ youtube_pick:
   sequence:
     - variables:
         node: "{{ states('input_text.yt_node') }}"
+        dash: >-
+          {% set ns = namespace(e='') %}
+          {% for s in states.select if s.entity_id.endswith('_dashboard') and node in s.entity_id and 'Drawn on the device' in s.attributes.options %}
+            {% set ns.e = s.entity_id %}
+          {% endfor %}
+          {{ ns.e }}
     - action: "esphome.{{ node }}_dashboard_hide"
     - action: select.select_option
-      target: { entity_id: "select.{{ node }}_dashboard" }
+      target: { entity_id: "{{ dash }}" }
       data: { option: "Tessera" }          # your normal mode
     - action: "esphome.{{ node }}_play_video"
       continue_on_error: true
@@ -125,7 +137,7 @@ youtube_pick_11: { alias: YT pick 11, sequence: [ { action: script.youtube_pick,
 youtube_pick_12: { alias: YT pick 12, sequence: [ { action: script.youtube_pick, data: { n: 12 } } ] }
 ```
 
-`youtube_search` waits 3 seconds before showing the dashboard so the voice turn finishes first, and puts the Show back to its normal mode after 3 minutes if nobody picks (`mode: restart` makes a new search cancel the old timer).
+`youtube_search` waits 3 seconds before showing the dashboard so the voice turn finishes first, and puts the Show back to its normal mode after 30 seconds if nobody picks (`mode: restart` makes a new search cancel the old timer).
 
 ### Dashboard
 Settings > Dashboards > Add dashboard > New from scratch, URL `yt-picker`. Open it, three-dot menu > Raw configuration editor, and paste this. Use your host's LAN IP for `<RESOLVER_HOST>`:
@@ -230,6 +242,6 @@ Other endpoints: `/resolve?q=...` returns `{"title","url"}` for the top hit dire
 ## Notes and limits
 - **LAN only.** Anyone who can reach port 8099 can make the host download and stream YouTube video. Don't port-forward it; consider publishing the port on your LAN IP only in `docker-compose.yaml`.
 - **One search at a time.** The 12 results and thumbnails are shared, and `input_text.yt_node` holds only the last Show that searched. Fine for one household; two Shows searching at once will overwrite each other's tiles.
-- If the picker is closed without choosing, the Show stays in *Drawn on the device* until the 3 minute timeout puts it back.
+- If the picker is closed without choosing, the Show stays in *Drawn on the device* until the 30 second timeout puts it back.
 - Thumbnails are 4:3 with the title underneath, because the Show crops 16:9 pictures to squarer tiles.
 - YouTube extraction breaks periodically; `docker compose restart` pulls the latest yt-dlp.
