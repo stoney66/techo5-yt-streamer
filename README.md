@@ -123,6 +123,3 @@ Edit the constants at the top of `yt_resolver.py`:
 - **Device times out / "error opening"** – check `docker logs yt-resolver`; a slow `/resolve` usually means yt-dlp is out of date (`docker compose restart`).
 - **Works once, then 404 on `/stream`** – sessions expire 15 s after the last client leaves, or 120 s if nobody connects.
 - **403 from YouTube** – restart to pull the latest yt-dlp; the `mweb` player client is used by default.
-
-## License
-Add your preferred license (e.g. MIT).
