@@ -3,41 +3,128 @@
 GET /resolve?q=<search words or youtube URL>
     Starts the pipeline, waits until ~500 KB is buffered, then returns
     {"title": ..., "url": "http://<this host>:8099/stream?s=<session>"}
+GET /search?q=...   -> top NRESULTS (12) results; thumbnails at /thumb/1.jpg .. /thumb/12.jpg (title drawn on)
+GET /pick?n=1..9    -> play result n of the last search (same JSON as /resolve)
 GET /stream?s=<session>   -> MPEG-TS (buffer first, then live).
     Reconnects are allowed (the newest client wins); the session is killed
     15 s after the last client leaves, or 120 s after /resolve if nobody connects.
 Needs: yt-dlp[default], deno, ffmpeg. LAN only!
 """
 import datetime
+import io
 import json
+import os
 import queue
 import re
 import secrets
 import subprocess
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-PORT = 8099
+PORT = int(os.environ.get("PORT", "8099"))
+BIND = os.environ.get("BIND", "0.0.0.0")
 # 18 = 360p H.264+AAC muxed (most reliable); fallback: muxed H.264/AAC <=720p
 FORMAT = "18/best[vcodec^=avc1][acodec^=mp4a][height<=720]"
 POT = ["--extractor-args", "youtube:player_client=mweb"]  # extra yt-dlp args (faster than the default client)
 YT_URL = re.compile(r"^https?://(www\.|m\.)?(youtube\.com|youtu\.be)/", re.I)
 VID = re.compile(r"^[A-Za-z0-9_-]{11}$")
-PREBUFFER_CHUNKS = 8      # 8 x 64 KB
+PREBUFFER_CHUNKS = 4      # 8 x 64 KB
 QUEUE_CHUNKS = 96         # ~6 MB backpressure
 START_TIMEOUT = 40
 IDLE_REAP = 120           # nobody ever connected
 DETACH_GRACE = 15         # no client for this long -> kill
-START_DELAY = 5           # seconds to hold the stream after /resolve returns (keeps the Show's info screen up)
+START_DELAY = 2           # seconds to hold the stream after /resolve returns (keeps the Show's info screen up)
 SESS = {}
+# --- tile picker: last search results + their thumbnails ---
+NRESULTS = int(os.environ.get("NRESULTS", "12"))   # tiles per search; lower it for small screens
+RESULTS = {}   # n -> {"vid", "title"}
+THUMBS = {}    # n -> jpeg bytes
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # spoken name (lowercase, no leading "the") -> channel /videos page; plays the NEWEST upload
 CHANNELS = {
-    # "some channel": "https://www.youtube.com/@SomeChannel/videos",
-    "secular talk": "https://www.youtube.com/@SecularTalk/videos",
+    # "my favourite channel": "https://www.youtube.com/@SomeChannel/videos",
 }
 
+
+def lookup(q, n=1):
+    """Return up to n [{vid,title}] for a search, URL, or CHANNELS shortcut; None on timeout."""
+    key = re.sub(r"^the ", "", q.lower()).strip()
+    extra = []
+    if key in CHANNELS:
+        target = CHANNELS[key]
+        extra = ["--playlist-items", f"1-{n}"]
+    elif YT_URL.match(q):
+        target = q
+    else:
+        target = f"ytsearch{n}:{q}"
+    try:
+        out = subprocess.run(
+            ["yt-dlp", "--flat-playlist", "--no-warnings", *extra, "--print",
+             "%(id)s\t%(title)s\t%(channel,uploader|)s\t%(upload_date|)s\t%(duration_string|)s",
+             "--", target],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    res = []
+    for line in out.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        vid, vtitle, channel, udate, dur = [p.strip() for p in (line.split("\t") + [""] * 5)[:5]]
+        if not VID.match(vid):
+            continue
+        when = ""
+        if re.fullmatch(r"\d{8}", udate):
+            when = datetime.datetime.strptime(udate, "%Y%m%d").strftime("%b %-d, %Y")
+        info = " | ".join(x for x in (channel, when, dur) if x and x != "NA")
+        res.append({"vid": vid, "title": f"{vtitle} ({info})" if info else vtitle, "short": vtitle})
+    return res[:n], out.stderr
+
+
+def make_thumb(vid, title):
+    """640x480 (4:3) JPEG: YouTube thumbnail on top, title underneath (never overlaid, never cropped
+    at the sides because the Show crops 16:9 pictures to squarer tiles). Needs Pillow."""
+    from PIL import Image, ImageDraw, ImageFont
+    W, H, PH = 640, 480, 360
+    im = Image.new("RGB", (W, H), (16, 24, 32))
+    if vid:
+        try:
+            raw = urllib.request.urlopen(f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg", timeout=10).read()
+            im.paste(Image.open(io.BytesIO(raw)).convert("RGB").resize((W, PH)), (0, 0))
+        except Exception:
+            pass
+    try:
+        font = ImageFont.truetype(FONT, 30)
+    except Exception:
+        font = ImageFont.load_default()
+    d = ImageDraw.Draw(im)
+    # drop emoji / symbols the font can't draw (they show as boxes)
+    title = re.sub(r"[\U00010000-\U0010FFFF\u2600-\u27BF\uFE0F\u200d]", "", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    maxlines, maxw, x0 = 3, 540, 50      # side margins survive the Show's crop
+    lines, cur = [], ""
+    for w in title.split():
+        t = (cur + " " + w).strip()
+        if d.textlength(t, font=font) > maxw and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = t
+    if cur:
+        lines.append(cur)
+    if len(lines) > maxlines:
+        lines = lines[:maxlines]
+        while lines[-1] and d.textlength(lines[-1] + "...", font=font) > maxw:
+            lines[-1] = lines[-1][:-1]
+        lines[-1] = lines[-1].rstrip() + "..."
+    for i, l in enumerate(lines):
+        d.text((x0, PH + 6 + 37 * i), l, font=font, fill=(255, 255, 255))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=85)
+    return buf.getvalue()
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
@@ -143,6 +230,13 @@ class H(BaseHTTPRequestHandler):
             return self._resolve(u)
         if u.path == "/stream":
             return self._stream(u)
+        if u.path == "/search":
+            return self._search(u)
+        if u.path == "/pick":
+            return self._pick(u)
+        m = re.fullmatch(r"/thumb/(\d+)\.jpg", u.path)
+        if m:
+            return self._thumb(int(m.group(1)))
         if u.path == "/loading":
             return self._loading(u)
         self._json(404, {"error": "not found"})
@@ -184,39 +278,7 @@ class H(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _resolve(self, u):
-        q = (parse_qs(u.query).get("q", [""])[0]).strip()
-        if not q:
-            return self._json(400, {"error": "missing q"})
-        key = re.sub(r"^the ", "", q.lower()).strip()
-        extra = []
-        if key in CHANNELS:
-            target = CHANNELS[key]
-            extra = ["--playlist-items", "1"]
-        elif YT_URL.match(q):
-            target = q
-        else:
-            target = f"ytsearch1:{q}"
-        try:
-            out = subprocess.run(
-                ["yt-dlp", "--flat-playlist", "--no-warnings", *extra,
-                 "--print",
-                 "%(id)s\t%(title)s\t%(channel,uploader|)s\t%(upload_date|)s\t%(duration_string|)s",
-                 "--", target],
-                capture_output=True, text=True, timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            return self._json(504, {"error": "search timed out"})
-        line = next((l for l in out.stdout.splitlines() if "\t" in l), "")
-        parts = (line.split("\t") + ["", "", "", "", ""])[:5]
-        vid, vtitle, channel, udate, dur = [p.strip() for p in parts]
-        if not VID.match(vid):
-            return self._json(502, {"error": (out.stderr or "no result")[-300:]})
-        when = ""
-        if re.fullmatch(r"\d{8}", udate):
-            when = datetime.datetime.strptime(udate, "%Y%m%d").strftime("%b %-d, %Y")
-        extra_info = " | ".join(x for x in (channel, when, dur) if x and x != "NA")
-        title = f"{vtitle} ({extra_info})" if extra_info else vtitle
+    def _play(self, vid, title):
         s = Session(vid)
         s.sid = secrets.token_urlsafe(9)
         SESS[s.sid] = s
@@ -228,6 +290,66 @@ class H(BaseHTTPRequestHandler):
         s.ready_at = time.time()
         log("session ready", s.sid, vid)
         self._json(200, {"title": title, "url": f"http://{host}/stream?s={s.sid}"})
+
+    def _resolve(self, u):
+        q = (parse_qs(u.query).get("q", [""])[0]).strip()
+        if not q:
+            return self._json(400, {"error": "missing q"})
+        r = lookup(q, 1)
+        if r is None:
+            return self._json(504, {"error": "search timed out"})
+        res, err = r
+        if not res:
+            return self._json(502, {"error": (err or "no result")[-300:]})
+        self._play(res[0]["vid"], res[0]["title"])
+
+    def _search(self, u):
+        """Store the top NRESULTS hits + thumbnails for the dashboard picker."""
+        q = (parse_qs(u.query).get("q", [""])[0]).strip()
+        if not q:
+            return self._json(400, {"error": "missing q"})
+        r = lookup(q, NRESULTS)
+        if r is None:
+            return self._json(504, {"error": "search timed out"})
+        res, err = r
+        if not res:
+            return self._json(502, {"error": (err or "no result")[-300:]})
+        thumbs = {}
+
+        def work(i, item):
+            thumbs[i] = make_thumb(item["vid"] if item else "", item["short"] if item else "")
+
+        items = {i + 1: (res[i] if i < len(res) else None) for i in range(NRESULTS)}
+        ts = [threading.Thread(target=work, args=(i, it)) for i, it in items.items()]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        RESULTS.clear()
+        RESULTS.update({i: it for i, it in items.items() if it})
+        THUMBS.clear()
+        THUMBS.update(thumbs)
+        log("search", q, "->", len(res), "results")
+        self._json(200, {"count": len(res), "results": [{"n": i, "title": it["title"]} for i, it in RESULTS.items()]})
+
+    def _pick(self, u):
+        try:
+            n = int(parse_qs(u.query).get("n", ["0"])[0])
+        except ValueError:
+            n = 0
+        it = RESULTS.get(n)
+        if not it:
+            return self._json(404, {"error": "no such result"})
+        self._play(it["vid"], it["title"])
+
+    def _thumb(self, n):
+        b = THUMBS.get(n)
+        if not b:
+            return self._json(404, {"error": "no thumbnail"})
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
 
     def _stream(self, u):
         sid = (parse_qs(u.query).get("s", [""])[0]).strip()
@@ -272,4 +394,4 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+    ThreadingHTTPServer((BIND, PORT), H).serve_forever()

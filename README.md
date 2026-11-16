@@ -105,6 +105,30 @@ YoutubePlay:
 ```
 Then run `conversation.reload` (or restart HA).
 
+## Tile picker (optional)
+
+Search by voice, then tap a thumbnail to play. `/search?q=...` keeps the top `NRESULTS` (default 12) results and renders `/thumb/1.jpg`..`/thumb/12.jpg` (title drawn on); `/pick?n=N` starts result N. Needs the Dashboard to be set to **Drawn on the device** while the picker is up.
+
+Setup: see `ha-picker.example.yaml` (REST commands, helper, scripts, dashboard view). Then point the voice intent at `script.youtube_search`:
+
+```yaml
+YoutubePlay:
+  action:
+    - action: script.turn_on
+      target: { entity_id: script.youtube_search }
+      data:
+        variables:
+          q: "{{ query }}"
+  speech:
+    text: "Okay"
+```
+
+Notes:
+- The picker switches the device's **Dashboard** setting to *Drawn on the device* and `youtube_pick` switches it back (to *Tessera* in the example - change it to your usual mode). If the picker is closed without a pick, switch it back by hand.
+- The drawn dashboard doesn't forward a card's `data:`, hence one tiny `youtube_pick_N` script (1-12) per tile.
+- Needs the device's Home Assistant token (**Connect to Home Assistant** on the setup page).
+- The 3 second delay in `youtube_search` keeps the voice turn from closing the dashboard.
+
 ## Configuration
 Edit the constants at the top of `yt_resolver.py`:
 
@@ -112,8 +136,9 @@ Edit the constants at the top of `yt_resolver.py`:
 |---|---|---|
 | `PORT` | `8099` | Listen port |
 | `FORMAT` | `18/best[vcodec^=avc1][acodec^=mp4a][height<=720]` | yt-dlp format; must be H.264 + AAC, muxed, ≤720p for the TECHO5 player |
-| `START_DELAY` | `5` | Seconds to hold the stream after `/resolve` (keeps the device info screen visible) |
-| `PREBUFFER_CHUNKS` | `8` | 64 KB chunks buffered before `/resolve` returns |
+| `START_DELAY` | `2` | Seconds to hold the stream after `/resolve` (keeps the device info screen visible) |
+| `PREBUFFER_CHUNKS` | `4` | 64 KB chunks buffered before `/resolve` returns |
+| `NRESULTS` (env) | `12` | Tiles per search. Lower it for small screens (Echo Show 5) |
 | `CHANNELS` | `{}` | `"spoken name": "https://www.youtube.com/@Channel/videos"` — plays the newest upload |
 
 ## Security
