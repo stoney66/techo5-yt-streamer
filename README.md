@@ -56,9 +56,11 @@ youtube_search:
     q: {}
   sequence:
     - variables:
+        sat_id: >-
+          {{ states.assist_satellite | selectattr('state','eq','processing')
+             | map(attribute='entity_id') | first | default('') }}
         node: >-
-          {% set sat = states.assist_satellite | selectattr('state','eq','processing') | list %}
-          {% if sat %}{{ device_attr(sat[0].entity_id, 'name') | slugify }}{% else %}my_show{% endif %}
+          {% if sat_id %}{{ device_attr(sat_id, 'name') | slugify }}{% else %}my_show{% endif %}
     - variables:
         dash: >-
           {% set ns = namespace(e='') %}
@@ -69,23 +71,37 @@ youtube_search:
     - action: input_text.set_value
       target: { entity_id: input_text.yt_node }
       data: { value: "{{ node }}" }
-    - action: rest_command.yt_search
-      data: { q: "{{ q }}" }
+    - parallel:
+        # branch 1: the search (runs while the voice reply plays)
+        - action: rest_command.yt_search
+          data: { q: "{{ q }}" }
+        # branch 2: once the voice turn is over, show a card so the screen isn't the clock
+        - sequence:
+            - wait_template: "{{ sat_id == '' or is_state(sat_id, 'idle') }}"
+              timeout: "00:00:15"
+              continue_on_timeout: true
+            - action: "esphome.{{ node }}_play_video"
+              continue_on_error: true
+              data:
+                title: "Searching {{ q }}"
+                url: "http://<RESOLVER_HOST>:8099/loading?t={{ q | urlencode }}"
     - action: select.select_option
       target: { entity_id: "{{ dash }}" }
       data: { option: "Drawn on the device" }
     - action: "esphome.{{ node }}_dashboard_path"
       data: { path: yt-picker/tiles }      # <dashboard url>/<view path>
-    - delay: "00:00:03"                    # lets the voice turn finish first
     - action: "esphome.{{ node }}_dashboard_show"
-    # picker timeout: if nobody picked within 30 seconds, go back
-    - delay: "00:00:30"
+    - delay: "00:00:01"
+    - action: "esphome.{{ node }}_stop_video"   # hand over from the card to the tiles
+      continue_on_error: true
+    # picker timeout: if nobody picked within 45 seconds, go back
+    - delay: "00:00:45"
     - if: "{{ is_state(dash, 'Drawn on the device') }}"
       then:
         - action: "esphome.{{ node }}_dashboard_hide"
         - action: select.select_option
           target: { entity_id: "{{ dash }}" }
-          data: { option: "Tessera" }
+          data: { option: "Tessera" }          # your normal mode
 
 youtube_pick:
   alias: YouTube pick tile
@@ -137,7 +153,7 @@ youtube_pick_11: { alias: YT pick 11, sequence: [ { action: script.youtube_pick,
 youtube_pick_12: { alias: YT pick 12, sequence: [ { action: script.youtube_pick, data: { n: 12 } } ] }
 ```
 
-`youtube_search` waits 3 seconds before showing the dashboard so the voice turn finishes first, and puts the Show back to its normal mode after 30 seconds if nobody picks (`mode: restart` makes a new search cancel the old timer).
+`youtube_search` runs the search while the voice reply finishes, waits for the satellite to go back to `idle` (so the reply screen can't land on top), shows a "Searching ..." card, then shows the picker and stops the card. It puts the Show back to its normal mode after 45 seconds if nobody picks (`mode: restart` makes a new search cancel the old timer).
 
 ### Dashboard
 Settings > Dashboards > Add dashboard > New from scratch, URL `yt-picker`. Open it, three-dot menu > Raw configuration editor, and paste this. Use your host's LAN IP for `<RESOLVER_HOST>`:
@@ -221,7 +237,7 @@ YoutubePlay:
         variables:
           q: "{{ query }}"
   speech:
-    text: "Loading {{ query }}"
+    text: "Looking for results on {{ query }}"
 ```
 
 Reload (`conversation.reload`, and reload intent scripts / scripts), then say **"play youtube super kitties"**.
@@ -232,6 +248,7 @@ Reload (`conversation.reload`, and reload intent scripts / scripts), then say **
 |---|---|---|
 | `PORT` (env) | `8099` | Listen port |
 | `BIND` (env) | `0.0.0.0` | Listen address inside the container |
+| `SHOW_DATES` (env) | `1` | Upload age badge on each tile ("12 min ago", "5 hr ago" up to 48 h, "3 days ago", then the date). Costs a few extra seconds per search; set `0` to turn off |
 | `NRESULTS` (env) | `12` | Tiles per search; lower it for small screens |
 | `FORMAT` | `18/best[vcodec^=avc1][acodec^=mp4a][height<=720]` | yt-dlp format; must be muxed H.264 + AAC, <=720p for the TECHO5 player |
 | `START_DELAY` | `2` | Seconds to hold the stream after `/pick` returns |
@@ -242,6 +259,7 @@ Other endpoints: `/resolve?q=...` returns `{"title","url"}` for the top hit dire
 ## Notes and limits
 - **LAN only.** Anyone who can reach port 8099 can make the host download and stream YouTube video. Don't port-forward it; consider publishing the port on your LAN IP only in `docker-compose.yaml`.
 - **One search at a time.** The 12 results and thumbnails are shared, and `input_text.yt_node` holds only the last Show that searched. Fine for one household; two Shows searching at once will overwrite each other's tiles.
-- If the picker is closed without choosing, the Show stays in *Drawn on the device* until the 30 second timeout puts it back.
+- If the picker is closed without choosing, the Show stays in *Drawn on the device* until the 45 second timeout puts it back.
+- Each tile has an upload-age badge (top left, e.g. "5 hr ago"), so you can tell which episode is newest. YouTube search results don't include dates, so the resolver looks each one up in parallel.
 - Thumbnails are 4:3 with the title underneath, because the Show crops 16:9 pictures to squarer tiles.
 - YouTube extraction breaks periodically; `docker compose restart` pulls the latest yt-dlp.

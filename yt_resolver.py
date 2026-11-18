@@ -43,6 +43,57 @@ NRESULTS = int(os.environ.get("NRESULTS", "12"))   # tiles per search; lower it 
 RESULTS = {}   # n -> {"vid", "title"}
 THUMBS = {}    # n -> jpeg bytes
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+SHOW_DATES = os.environ.get("SHOW_DATES", "1") != "0"   # upload age badge on each tile (adds a few seconds to a search)
+DATES = {}   # video id -> "YYYYMMDD" cache
+
+
+def fetch_date(vid):
+    """(epoch seconds or 0, 'YYYYMMDD' or '') for one video; flat search results carry neither."""
+    if vid in DATES:
+        return DATES[vid]
+    ts, ud = 0, ""
+    try:
+        out = subprocess.run(
+            ["yt-dlp", "--no-playlist", "--skip-download", "--no-warnings", *POT,
+             "--print", "%(timestamp)s\t%(upload_date)s", "--", f"https://www.youtube.com/watch?v={vid}"],
+            capture_output=True, text=True, timeout=25,
+        )
+        parts = ((out.stdout.strip().splitlines() or [""])[-1].split("\t") + ["", ""])[:2]
+        ts = int(float(parts[0])) if re.fullmatch(r"\d+(\.\d+)?", parts[0].strip()) else 0
+        ud = parts[1].strip() if re.fullmatch(r"\d{8}", parts[1].strip()) else ""
+    except Exception:
+        pass
+    if ts or ud:
+        DATES[vid] = (ts, ud)
+    return (ts, ud)
+
+
+def pretty_date(ts, ud=""):
+    """'12 min ago' / '5 hr ago' (under 48 h) / '3 days ago' (under 2 weeks) / 'Nov 4' / 'Dec 30, 2025'."""
+    now = time.time()
+    if ts:
+        age = now - ts
+        if age < 0:
+            age = 0
+        if age < 3600:
+            return f"{max(1, int(age // 60))} min ago"
+        if age < 48 * 3600:
+            return f"{int(age // 3600)} hr ago"
+        if age < 14 * 86400:
+            return f"{int(age // 86400)} days ago"
+        dt = datetime.datetime.fromtimestamp(ts)
+    elif re.fullmatch(r"\d{8}", ud or ""):
+        dt = datetime.datetime.strptime(ud, "%Y%m%d")
+        days = (datetime.date.today() - dt.date()).days
+        if days <= 0:
+            return "Today"
+        if days == 1:
+            return "Yesterday"
+        if days < 14:
+            return f"{days} days ago"
+    else:
+        return ""
+    return dt.strftime("%b %-d") if dt.year == datetime.date.today().year else dt.strftime("%b %-d, %Y")
 
 
 def lookup(q, n=1):
@@ -72,11 +123,22 @@ def lookup(q, n=1):
         if re.fullmatch(r"\d{8}", udate):
             when = datetime.datetime.strptime(udate, "%Y%m%d").strftime("%b %-d, %Y")
         info = " | ".join(x for x in (channel, when, dur) if x and x != "NA")
-        res.append({"vid": vid, "title": f"{vtitle} ({info})" if info else vtitle, "short": vtitle})
-    return res[:n], out.stderr
+        res.append({"vid": vid, "title": f"{vtitle} ({info})" if info else vtitle, "short": vtitle,
+                    "udate": udate if re.fullmatch(r"\d{8}", udate) else "", "ts": 0})
+    res = res[:n]
+    if SHOW_DATES and n > 1:
+        need = [r for r in res if not r["udate"] and not r["ts"]]
+        if need:
+            from concurrent.futures import ThreadPoolExecutor
+            t0 = time.time()
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                for r, (ts, ud) in zip(need, ex.map(lambda r: fetch_date(r["vid"]), need)):
+                    r["ts"], r["udate"] = ts, ud
+            log("dates fetched in %.1fs" % (time.time() - t0))
+    return res, out.stderr
 
 
-def make_thumb(vid, title):
+def make_thumb(vid, title, date=""):
     """640x480 (4:3) JPEG: YouTube thumbnail on top, title underneath (never overlaid, never cropped
     at the sides because the Show crops 16:9 pictures to squarer tiles). Needs Pillow."""
     from PIL import Image, ImageDraw, ImageFont
@@ -114,6 +176,14 @@ def make_thumb(vid, title):
         lines[-1] = lines[-1].rstrip() + "..."
     for i, l in enumerate(lines):
         d.text((x0, PH + 6 + 37 * i), l, font=font, fill=(255, 255, 255))
+    if date:   # upload date badge, top left
+        try:
+            bf = ImageFont.truetype(FONT, 32)
+        except Exception:
+            bf = font
+        tw = d.textlength(date, font=bf)
+        d.rounded_rectangle([20, 16, 20 + tw + 28, 16 + 50], radius=10, fill=(0, 0, 0))
+        d.text((34, 22), date, font=bf, fill=(255, 214, 10))
     buf = io.BytesIO()
     im.save(buf, "JPEG", quality=85)
     return buf.getvalue()
@@ -309,7 +379,8 @@ class H(BaseHTTPRequestHandler):
         thumbs = {}
 
         def work(i, item):
-            thumbs[i] = make_thumb(item["vid"] if item else "", item["short"] if item else "")
+            thumbs[i] = make_thumb(item["vid"] if item else "", item["short"] if item else "",
+                                   pretty_date(item.get("ts", 0), item.get("udate", "")) if item else "")
 
         items = {i + 1: (res[i] if i < len(res) else None) for i in range(NRESULTS)}
         ts = [threading.Thread(target=work, args=(i, it)) for i, it in items.items()]
